@@ -1,6 +1,10 @@
-use std::{process::Command, thread, time::Duration};
+use std::{
+    process::{Child, Command},
+    thread,
+    time::Duration,
+};
 
-pub type SupervisorTest = Box<dyn Fn() -> bool>;
+pub type SupervisorTest = Box<dyn FnMut(&mut Child) -> bool>;
 
 pub struct SupervisedProcess {
     process: String,
@@ -83,7 +87,7 @@ impl SupervisedProcess {
         let mut child = process.expect("Failed to start process");
         loop {
             thread::sleep(self.check_interval);
-            if self.tests.iter().any(|test| !test()) {
+            if self.tests.iter_mut().any(|test| !test(&mut child)) {
                 child.kill().unwrap_or_else(|_e| {
                     println!("Failed to kill {}", self.process);
                 });
@@ -122,14 +126,33 @@ mod tests {
 
     #[test]
     fn it_builds_a_process_adding_a_test() {
-        let process = SupervisedProcess::new("test".to_string()).add_test(Box::from(|| false));
+        let process = SupervisedProcess::new("test".to_string())
+            .add_test(Box::from(|_child: &mut Child| false));
         assert_eq!(process.tests.len(), 1);
+    }
+
+    #[test]
+    fn use_child_in_test() {
+        let mut process = SupervisedProcess::new("sleep".to_string())
+            .with_args(vec!["2"])
+            .add_test(Box::from(|child: &mut Child| match child.try_wait() {
+                Ok(None) => true,
+                Ok(Some(exit_value)) => {
+                    println!("Got exit value {}", exit_value);
+                    false
+                }
+                _ => false,
+            }))
+            .with_backoff_time(Duration::from_secs(1))
+            .with_check_interval(Duration::from_secs(1))
+            .with_restart_times(0);
+        process.run();
     }
 
     #[test]
     fn it_runs_the_command() {
         let mut process = SupervisedProcess::new("ls".to_string())
-            .add_test(Box::from(|| false))
+            .add_test(Box::from(|_child: &mut Child| false))
             .with_check_interval(Duration::from_millis(10))
             .with_backoff_time(Duration::from_millis(10))
             .with_restart_times(1);
@@ -140,7 +163,7 @@ mod tests {
     fn it_runs_the_command_with_args() {
         let mut process = SupervisedProcess::new("ls".to_string())
             .with_args(vec!["-l"])
-            .add_test(Box::from(|| false))
+            .add_test(Box::from(|_child: &mut Child| false))
             .with_check_interval(Duration::from_millis(10))
             .with_backoff_time(Duration::from_millis(10))
             .with_restart_times(1);
