@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn use_child_in_test() {
         let mut process = SupervisedProcess::new("sleep".to_string())
-            .with_args(vec!["2"])
+            .with_args(vec!["0.2"])
             .add_test(Box::from(|child: &mut Child| match child.try_wait() {
                 Ok(None) => true,
                 Ok(Some(exit_value)) => {
@@ -143,8 +143,7 @@ mod tests {
                 }
                 _ => false,
             }))
-            .with_backoff_time(Duration::from_secs(1))
-            .with_check_interval(Duration::from_secs(1))
+            .with_check_interval(Duration::from_millis(5))
             .with_restart_times(0);
         process.run();
     }
