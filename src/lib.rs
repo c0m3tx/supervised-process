@@ -80,6 +80,15 @@ impl SupervisedProcess {
         }
     }
 
+    fn fails(test: &mut (String, SupervisorTest), child: &mut Child) -> bool {
+        if test.1(child) {
+            return false;
+        }
+
+        println!("{} test failed", test.0);
+        true
+    }
+
     pub fn run(&mut self) {
         let process = Command::new(self.process.clone())
             .args(self.args.clone())
@@ -88,14 +97,11 @@ impl SupervisedProcess {
         loop {
             thread::sleep(self.check_interval);
             println!("Running tests on {}", self.process);
-            if self.tests.iter_mut().any(|test| {
-                if !test.1(&mut child) {
-                    println!("{} test failed", test.0);
-                    true
-                } else {
-                    false
-                }
-            }) {
+            if self
+                .tests
+                .iter_mut()
+                .any(|test| Self::fails(test, &mut child))
+            {
                 child.kill().unwrap_or_else(|_e| {
                     println!("Failed to kill {}", self.process);
                 });
@@ -109,6 +115,8 @@ impl SupervisedProcess {
                     println!("Will not restart {}", self.process);
                 }
                 return;
+            } else {
+                println!("Tests OK")
             }
         }
     }
