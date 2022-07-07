@@ -87,6 +87,7 @@ impl SupervisedProcess {
         let mut child = process.expect("Failed to start process");
         loop {
             thread::sleep(self.check_interval);
+            println!("Running tests on {}", self.process);
             if self.tests.iter_mut().any(|test| !test(&mut child)) {
                 child.kill().unwrap_or_else(|_e| {
                     println!("Failed to kill {}", self.process);
