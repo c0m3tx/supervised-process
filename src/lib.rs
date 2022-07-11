@@ -4,18 +4,27 @@ use std::{
     time::Duration,
 };
 
+enum Operation {
+    Restart,
+    NoRestart,
+}
+
 pub type SupervisorTest = Box<dyn FnMut(&mut Child) -> bool>;
 
-pub struct SupervisedProcess {
+pub struct SupervisedProcess<'a> {
     process: String,
     args: Vec<String>,
     restart_times: Option<u64>,
     check_interval: Duration,
     backoff_time: Duration,
     tests: Vec<(String, SupervisorTest)>,
+    on_test_start: Option<&'a mut dyn FnMut()>,
+    on_tests_ok: Option<&'a mut dyn FnMut()>,
+    on_test_error: Option<&'a mut dyn FnMut(&str)>,
+    on_restart: Option<&'a mut dyn FnMut()>,
 }
 
-impl Default for SupervisedProcess {
+impl<'a> Default for SupervisedProcess<'a> {
     fn default() -> Self {
         Self {
             process: "".to_string(),
@@ -24,11 +33,29 @@ impl Default for SupervisedProcess {
             check_interval: Duration::from_secs(30),
             backoff_time: Duration::from_secs(30),
             tests: vec![],
+            on_test_start: None,
+            on_tests_ok: None,
+            on_test_error: None,
+            on_restart: None,
         }
     }
 }
 
-impl SupervisedProcess {
+macro_rules! event {
+    ($handler:expr) => {
+        if let Some(handler) = &mut $handler {
+            handler();
+        }
+    };
+
+    ($handler:expr, $($arg:expr),+) => {
+        if let Some(handler) = &mut $handler {
+            handler($($arg),+);
+        }
+    };
+}
+
+impl<'a> SupervisedProcess<'a> {
     pub fn new(process: String) -> Self {
         Self {
             process,
@@ -80,43 +107,75 @@ impl SupervisedProcess {
         }
     }
 
-    fn fails(test: &mut (String, SupervisorTest), child: &mut Child) -> bool {
-        if test.1(child) {
-            return false;
+    pub fn on_restart(self, on_restart: &'a mut dyn FnMut()) -> Self {
+        Self {
+            on_restart: Some(on_restart),
+            ..self
         }
-
-        println!("{} test failed", test.0);
-        true
     }
 
-    pub fn run(&mut self) {
-        let process = Command::new(self.process.clone())
-            .args(self.args.clone())
-            .spawn();
-        let mut child = process.expect("Failed to start process");
+    pub fn on_test_start(self, on_test_start: &'a mut dyn FnMut()) -> Self {
+        Self {
+            on_test_start: Some(on_test_start),
+            ..self
+        }
+    }
+
+    pub fn on_tests_ok(self, on_tests_ok: &'a mut dyn FnMut()) -> Self {
+        Self {
+            on_tests_ok: Some(on_tests_ok),
+            ..self
+        }
+    }
+
+    pub fn on_test_error(self, on_test_error: &'a mut dyn FnMut(&str)) -> Self {
+        Self {
+            on_test_error: Some(on_test_error),
+            ..self
+        }
+    }
+
+    fn test_loop(&mut self, child: &mut Child) -> Result<Operation, String> {
         loop {
             thread::sleep(self.check_interval);
-            println!("Running tests on {}", self.process);
-            if self
-                .tests
-                .iter_mut()
-                .any(|test| Self::fails(test, &mut child))
-            {
-                child.kill().unwrap_or_else(|_e| {
-                    println!("Failed to kill {}", self.process);
-                });
+
+            event!(self.on_test_start);
+
+            if !self.tests.iter_mut().all(|test| {
+                if test.1(child) {
+                    return true;
+                }
+
+                event!(self.on_test_error, &test.0);
+                false
+            }) {
+                let _ = child.kill();
 
                 if self.should_restart() {
                     thread::sleep(self.backoff_time);
-                    println!("Restarting {}", self.process);
+                    event!(self.on_restart);
 
-                    return self.run();
+                    return Ok(Operation::Restart);
                 } else {
-                    println!("Will not restart {}", self.process);
+                    // println!("Will not restart {}", self.process);
+                    return Ok(Operation::NoRestart);
                 }
-                return;
             } else {
-                println!("Tests OK")
+                event!(self.on_tests_ok);
+            }
+        }
+    }
+
+    pub fn run(&mut self) -> Result<(), String> {
+        loop {
+            let process = Command::new(self.process.clone())
+                .args(self.args.clone())
+                .spawn();
+            let mut child = process.map_err(|_| String::from("Failed to start process"))?;
+            match self.test_loop(&mut child) {
+                Ok(Operation::NoRestart) => return Ok(()),
+                Err(e) => return Err(e),
+                _ => {}
             }
         }
     }
@@ -148,6 +207,29 @@ mod tests {
     }
 
     #[test]
+    fn it_restarts_once() {
+        let mut restart_count: i32 = 0;
+        let mut restart_fn = || {
+            restart_count += 1;
+        };
+
+        let mut start_fn = || {
+            println!("Started");
+        };
+
+        let mut process = SupervisedProcess::new("ls".to_string())
+            .add_test("always false", Box::from(|_: &mut Child| false))
+            .with_check_interval(Duration::from_millis(1))
+            .with_backoff_time(Duration::from_millis(1))
+            .with_restart_times(1)
+            .on_restart(&mut restart_fn)
+            .on_test_start(&mut start_fn);
+
+        assert!(process.run().is_ok());
+        assert_eq!(restart_count, 1)
+    }
+
+    #[test]
     fn use_child_in_test() {
         let mut process = SupervisedProcess::new("sleep".to_string())
             .with_args(vec!["0.2"])
@@ -164,7 +246,7 @@ mod tests {
             )
             .with_check_interval(Duration::from_millis(5))
             .with_restart_times(0);
-        process.run();
+        assert!(process.run().is_ok());
     }
 
     #[test]
@@ -174,7 +256,7 @@ mod tests {
             .with_check_interval(Duration::from_millis(10))
             .with_backoff_time(Duration::from_millis(10))
             .with_restart_times(1);
-        process.run();
+        assert!(process.run().is_ok());
     }
 
     #[test]
@@ -185,6 +267,6 @@ mod tests {
             .with_check_interval(Duration::from_millis(10))
             .with_backoff_time(Duration::from_millis(10))
             .with_restart_times(1);
-        process.run();
+        assert!(process.run().is_ok());
     }
 }
