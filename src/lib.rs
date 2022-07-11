@@ -18,10 +18,11 @@ pub struct SupervisedProcess<'a> {
     check_interval: Duration,
     backoff_time: Duration,
     tests: Vec<(String, SupervisorTest)>,
-    on_test_start: Option<&'a mut dyn FnMut()>,
-    on_tests_ok: Option<&'a mut dyn FnMut()>,
-    on_test_error: Option<&'a mut dyn FnMut(&str)>,
-    on_restart: Option<&'a mut dyn FnMut()>,
+    on_test_start: Option<&'a dyn Fn()>,
+    on_tests_ok: Option<&'a dyn Fn()>,
+    on_test_error: Option<&'a dyn Fn(&str)>,
+    on_restart: Option<&'a dyn Fn()>,
+    on_no_restart: Option<&'a dyn Fn()>,
 }
 
 impl<'a> Default for SupervisedProcess<'a> {
@@ -37,19 +38,20 @@ impl<'a> Default for SupervisedProcess<'a> {
             on_tests_ok: None,
             on_test_error: None,
             on_restart: None,
+            on_no_restart: None,
         }
     }
 }
 
 macro_rules! event {
     ($handler:expr) => {
-        if let Some(handler) = &mut $handler {
+        if let Some(handler) = $handler {
             handler();
         }
     };
 
     ($handler:expr, $($arg:expr),+) => {
-        if let Some(handler) = &mut $handler {
+        if let Some(handler) = $handler {
             handler($($arg),+);
         }
     };
@@ -107,28 +109,35 @@ impl<'a> SupervisedProcess<'a> {
         }
     }
 
-    pub fn on_restart(self, on_restart: &'a mut dyn FnMut()) -> Self {
+    pub fn on_restart(self, on_restart: &'a dyn Fn()) -> Self {
         Self {
             on_restart: Some(on_restart),
             ..self
         }
     }
 
-    pub fn on_test_start(self, on_test_start: &'a mut dyn FnMut()) -> Self {
+    pub fn on_no_restart(self, on_no_restart: &'a dyn Fn()) -> Self {
+        Self {
+            on_no_restart: Some(on_no_restart),
+            ..self
+        }
+    }
+
+    pub fn on_test_start(self, on_test_start: &'a dyn Fn()) -> Self {
         Self {
             on_test_start: Some(on_test_start),
             ..self
         }
     }
 
-    pub fn on_tests_ok(self, on_tests_ok: &'a mut dyn FnMut()) -> Self {
+    pub fn on_tests_ok(self, on_tests_ok: &'a dyn Fn()) -> Self {
         Self {
             on_tests_ok: Some(on_tests_ok),
             ..self
         }
     }
 
-    pub fn on_test_error(self, on_test_error: &'a mut dyn FnMut(&str)) -> Self {
+    pub fn on_test_error(self, on_test_error: &'a dyn Fn(&str)) -> Self {
         Self {
             on_test_error: Some(on_test_error),
             ..self
@@ -154,10 +163,9 @@ impl<'a> SupervisedProcess<'a> {
                 if self.should_restart() {
                     thread::sleep(self.backoff_time);
                     event!(self.on_restart);
-
                     return Ok(Operation::Restart);
                 } else {
-                    // println!("Will not restart {}", self.process);
+                    event!(self.on_no_restart);
                     return Ok(Operation::NoRestart);
                 }
             } else {
@@ -173,9 +181,9 @@ impl<'a> SupervisedProcess<'a> {
                 .spawn();
             let mut child = process.map_err(|_| String::from("Failed to start process"))?;
             match self.test_loop(&mut child) {
+                Ok(Operation::Restart) => continue,
                 Ok(Operation::NoRestart) => return Ok(()),
                 Err(e) => return Err(e),
-                _ => {}
             }
         }
     }
@@ -183,6 +191,8 @@ impl<'a> SupervisedProcess<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
     #[test]
@@ -207,26 +217,107 @@ mod tests {
     }
 
     #[test]
-    fn it_restarts_once() {
-        let mut restart_count: i32 = 0;
-        let mut restart_fn = || {
-            restart_count += 1;
+    fn event_on_restart() {
+        let restart_count: RefCell<i32> = RefCell::new(0);
+        let restart_fn = || {
+            (*restart_count.borrow_mut()) += 1;
         };
 
-        let mut start_fn = || {
-            println!("Started");
-        };
-
-        let mut process = SupervisedProcess::new("ls".to_string())
+        let mut process = SupervisedProcess::new("echo".to_string())
+            .with_args(vec!["-n"])
             .add_test("always false", Box::from(|_: &mut Child| false))
             .with_check_interval(Duration::from_millis(1))
             .with_backoff_time(Duration::from_millis(1))
             .with_restart_times(1)
-            .on_restart(&mut restart_fn)
-            .on_test_start(&mut start_fn);
+            .on_restart(&restart_fn);
 
         assert!(process.run().is_ok());
-        assert_eq!(restart_count, 1)
+        let guard = restart_count.borrow();
+
+        assert_eq!(*guard, 1)
+    }
+
+    #[test]
+    fn event_on_no_restart() {
+        let no_restart_count: RefCell<i32> = RefCell::new(0);
+        let no_restart_fn = || {
+            (*no_restart_count.borrow_mut()) += 1;
+        };
+
+        let mut process = SupervisedProcess::new("echo".to_string())
+            .with_args(vec!["-n"])
+            .add_test("always false", Box::from(|_: &mut Child| false))
+            .with_check_interval(Duration::from_millis(1))
+            .with_backoff_time(Duration::from_millis(1))
+            .with_restart_times(1)
+            .on_no_restart(&no_restart_fn);
+
+        assert!(process.run().is_ok());
+
+        assert_eq!(*no_restart_count.borrow(), 1);
+    }
+
+    #[test]
+    fn event_on_test_error() {
+        let error_fn = |name: &str| assert_eq!("always false", name);
+
+        let mut process = SupervisedProcess::new("echo".to_string())
+            .with_args(vec!["-n"])
+            .add_test("always false", Box::from(|_: &mut Child| false))
+            .with_check_interval(Duration::from_millis(1))
+            .with_backoff_time(Duration::from_millis(1))
+            .with_restart_times(0)
+            .on_test_error(&error_fn);
+
+        assert!(process.run().is_ok());
+    }
+
+    #[test]
+    fn event_on_test_run() {
+        let test_run_count: RefCell<i32> = RefCell::new(0);
+        let test_run_fn = || {
+            (*test_run_count.borrow_mut()) += 1;
+        };
+
+        let mut process = SupervisedProcess::new("echo".to_string())
+            .with_args(vec!["-n"])
+            .add_test("always false", Box::from(|_: &mut Child| false))
+            .with_check_interval(Duration::from_millis(1))
+            .with_backoff_time(Duration::from_millis(1))
+            .with_restart_times(1)
+            .on_test_start(&test_run_fn);
+
+        assert!(process.run().is_ok());
+        assert_eq!(*test_run_count.borrow(), 2);
+    }
+
+    #[test]
+    fn event_on_test_ok() {
+        let mut test_ok_count = 0;
+        let test_ok_ptr: *mut i32 = &mut test_ok_count;
+
+        let test_ok_fn = || unsafe { *test_ok_ptr += 1 };
+
+        let mut process = SupervisedProcess::new("sleep".to_string())
+            .with_args(vec!["0.1"])
+            .add_test(
+                "not running",
+                Box::from(|child: &mut Child| {
+                    if let Ok(None) = child.try_wait() {
+                        true
+                    } else {
+                        false
+                    }
+                }),
+            )
+            .with_check_interval(Duration::from_millis(80))
+            .with_backoff_time(Duration::from_millis(80))
+            .with_restart_times(0)
+            .on_tests_ok(&test_ok_fn);
+        assert!(process.run().is_ok());
+        drop(process);
+
+        assert_eq!(test_ok_count, 1);
     }
 
     #[test]
@@ -251,7 +342,7 @@ mod tests {
 
     #[test]
     fn it_runs_the_command() {
-        let mut process = SupervisedProcess::new("ls".to_string())
+        let mut process = SupervisedProcess::new("echo".to_string())
             .add_test("always false", Box::from(|_child: &mut Child| false))
             .with_check_interval(Duration::from_millis(10))
             .with_backoff_time(Duration::from_millis(10))
@@ -261,8 +352,8 @@ mod tests {
 
     #[test]
     fn it_runs_the_command_with_args() {
-        let mut process = SupervisedProcess::new("ls".to_string())
-            .with_args(vec!["-l"])
+        let mut process = SupervisedProcess::new("echo".to_string())
+            .with_args(vec!["-n"])
             .add_test("always false", Box::from(|_child: &mut Child| false))
             .with_check_interval(Duration::from_millis(10))
             .with_backoff_time(Duration::from_millis(10))
