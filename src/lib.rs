@@ -19,7 +19,8 @@ pub struct SupervisedProcess<'a> {
     backoff_time: Duration,
     tests: Vec<(String, SupervisorTest)>,
     on_test_start: Option<&'a dyn Fn()>,
-    on_tests_ok: Option<&'a dyn Fn()>,
+    on_tests_passing: Option<&'a dyn Fn()>,
+    on_test_ok: Option<&'a dyn Fn(&str)>,
     on_test_error: Option<&'a dyn Fn(&str)>,
     on_restart: Option<&'a dyn Fn()>,
     on_no_restart: Option<&'a dyn Fn()>,
@@ -35,7 +36,8 @@ impl<'a> Default for SupervisedProcess<'a> {
             backoff_time: Duration::from_secs(30),
             tests: vec![],
             on_test_start: None,
-            on_tests_ok: None,
+            on_tests_passing: None,
+            on_test_ok: None,
             on_test_error: None,
             on_restart: None,
             on_no_restart: None,
@@ -130,9 +132,16 @@ impl<'a> SupervisedProcess<'a> {
         }
     }
 
-    pub fn on_tests_ok(self, on_tests_ok: &'a dyn Fn()) -> Self {
+    pub fn on_tests_passing(self, on_tests_passing: &'a dyn Fn()) -> Self {
         Self {
-            on_tests_ok: Some(on_tests_ok),
+            on_tests_passing: Some(on_tests_passing),
+            ..self
+        }
+    }
+
+    pub fn on_test_ok(self, on_test_ok: &'a dyn Fn(&str)) -> Self {
+        Self {
+            on_test_ok: Some(on_test_ok),
             ..self
         }
     }
@@ -152,11 +161,12 @@ impl<'a> SupervisedProcess<'a> {
 
             if !self.tests.iter_mut().all(|test| {
                 if test.1(child) {
-                    return true;
+                    event!(self.on_test_ok, test.0.as_str());
+                    true
+                } else {
+                    event!(self.on_test_error, &test.0);
+                    false
                 }
-
-                event!(self.on_test_error, &test.0);
-                false
             }) {
                 let _ = child.kill();
 
@@ -169,7 +179,7 @@ impl<'a> SupervisedProcess<'a> {
                     return Ok(Operation::NoRestart);
                 }
             } else {
-                event!(self.on_tests_ok);
+                event!(self.on_tests_passing);
             }
         }
     }
@@ -313,7 +323,7 @@ mod tests {
             .with_check_interval(Duration::from_millis(80))
             .with_backoff_time(Duration::from_millis(80))
             .with_restart_times(0)
-            .on_tests_ok(&test_ok_fn);
+            .on_tests_passing(&test_ok_fn);
         assert!(process.run().is_ok());
         drop(process);
 
